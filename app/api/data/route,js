@@ -1,0 +1,23 @@
+import mqtt from "mqtt";
+import { supabase } from "../../../lib/supabase";
+
+let lastData = { temperature: 0, humidity: 0 };
+const client = mqtt.connect("wss://broker.hivemq.com:8884/mqtt");
+
+client.on("connect", () => {
+  client.subscribe("jetson/box/sensor");
+});
+
+client.on("message", async (_, msg) => {
+  try {
+    const data = JSON.parse(msg.toString());
+    lastData = data;
+    await supabase.from("sensor_logs").insert([data]);
+  } catch (err) {
+    console.error("Insert failed:", err.message);
+  }
+});
+
+export async function GET() {
+  return Response.json(lastData);
+}
