@@ -16,9 +16,12 @@ export default function Dashboard() {
   const [temperature, setTemperature] = useState(0);
   const [humidity, setHumidity] = useState(0);
   const [timeRange, setTimeRange] = useState(5 * 60 * 1000); // 5 นาที
-  const lastSaveRef = useRef(0);
+  const [connectionStatus, setConnectionStatus] = useState("connected");
 
-  // โหลดข้อมูลจากฐานข้อมูล
+  const lastSaveRef = useRef(0);
+  const lastMessageRef = useRef(Date.now());
+
+  // 🧩 โหลดข้อมูลย้อนหลังจาก Supabase
   useEffect(() => {
     async function fetchData() {
       const since = new Date(Date.now() - timeRange).toISOString();
@@ -41,15 +44,18 @@ export default function Dashboard() {
         setData(formatted);
       }
     }
+
     fetchData();
   }, [timeRange]);
 
-  // รับ MQTT และอัปเดตเรียลไทม์
+  // 🔌 MQTT และการอัปเดตเรียลไทม์
   useEffect(() => {
     const client = mqtt.connect("wss://broker.hivemq.com:8884/mqtt");
+    let intervalId;
 
     client.on("connect", () => {
       client.subscribe("jetson/box/sensor");
+      console.log("✅ MQTT connected");
     });
 
     client.on("message", async (topic, message) => {
@@ -57,12 +63,12 @@ export default function Dashboard() {
         const payload = JSON.parse(message.toString());
         const { temperature, humidity } = payload;
         const now = new Date();
-    
-        // อัปเดตค่าปัจจุบัน
+
+        lastMessageRef.current = Date.now();
         setTemperature(temperature);
         setHumidity(humidity);
-    
-        // เพิ่มจุดใหม่ทุก 1 วิ และลบจุดเก่าทันที (กราฟเลื่อนต่อเนื่อง)
+
+        // ✅ เพิ่มจุดใหม่และลบข้อมูลเกินช่วงเวลา
         setData((prev) => {
           const newEntry = {
             time: now.toLocaleTimeString("th-TH", {
@@ -73,35 +79,75 @@ export default function Dashboard() {
             humidity,
             timestamp: now.getTime(),
           };
-    
-          // จำกัดจำนวนจุดตามช่วงเวลา (เลื่อนสด ๆ)
-          const updated = [...prev, newEntry];
-          const maxPoints = timeRange / 1000; // หน่วยวินาที
-          return updated.length > maxPoints
-            ? updated.slice(updated.length - maxPoints)
-            : updated;
+          const updated = [...prev, newEntry].filter(
+            (d) => now.getTime() - d.timestamp <= timeRange
+          );
+          return updated;
         });
-    
-        // บันทึกข้อมูลลงฐานทุก 15 วิ
-        const nowMs = Date.now();
-        if (nowMs - lastSaveRef.current >= 15000) {
-          lastSaveRef.current = nowMs;
-          await fetch("/api/log", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ temperature, humidity }),
-          });
+
+        // ✅ เขียนลงฐานข้อมูลทุก 15 วินาที
+        const sec = now.getSeconds();
+        if (sec % 15 === 0) {
+          const nowMs = Date.now();
+          if (nowMs - lastSaveRef.current >= 1000) {
+            lastSaveRef.current = nowMs;
+            await fetch("/api/log", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ temperature, humidity }),
+            });
+          }
         }
       } catch (err) {
         console.error("MQTT message error:", err);
       }
     });
-    
 
-    return () => client.end();
+    // 🔍 ตรวจสอบสถานะการเชื่อมต่อและอัปเดตกราฟต่อเนื่อง
+    intervalId = setInterval(() => {
+      const elapsed = Date.now() - lastMessageRef.current;
+
+      if (elapsed < 20000) setConnectionStatus("connected");
+      else if (elapsed < 40000) setConnectionStatus("unstable");
+      else setConnectionStatus("lost");
+
+      // ถ้าไม่มีข้อมูลใหม่เกิน 2 วินาที → ลากค่าล่าสุดต่อ
+      setData((prev) => {
+        if (prev.length === 0) return prev;
+        const last = prev[prev.length - 1];
+        const now = new Date();
+        const gap = now.getTime() - last.timestamp;
+
+        if (gap >= 2000) {
+          const hold = {
+            time: now.toLocaleTimeString("th-TH", {
+              hour12: false,
+              timeZone: "Asia/Bangkok",
+            }),
+            temperature: last.temperature,
+            humidity: last.humidity,
+            timestamp: now.getTime(),
+            offline:
+              elapsed > 40000 ||
+              (elapsed > 30000 && connectionStatus === "lost"),
+          };
+          const updated = [...prev, hold].filter(
+            (d) => now.getTime() - d.timestamp <= timeRange
+          );
+          return updated;
+        }
+
+        return prev;
+      });
+    }, 1000);
+
+    return () => {
+      clearInterval(intervalId);
+      client.end();
+    };
   }, [timeRange]);
 
-  // ปุ่มช่วงเวลา
+  // 🕒 ปุ่มเลือกช่วงเวลา
   const timeRanges = {
     "1 นาที": 60 * 1000,
     "5 นาที": 5 * 60 * 1000,
@@ -111,19 +157,111 @@ export default function Dashboard() {
     "1 วัน": 24 * 60 * 60 * 1000,
   };
 
-  // Export CSV
-  const exportCSV = () => {
-    const header = "Time,Temperature (°C),Humidity (%)\n";
-    const rows = data
-      .map((d) => `${d.time},${d.temperature},${d.humidity}`)
+  // 📊 สถิติ
+  const avgTemp =
+    data.length > 0
+      ? (data.reduce((a, b) => a + b.temperature, 0) / data.length).toFixed(1)
+      : 0;
+
+  const avgHum =
+    data.length > 0
+      ? (data.reduce((a, b) => a + b.humidity, 0) / data.length).toFixed(1)
+      : 0;
+
+  const maxTemp = Math.max(...data.map((d) => d.temperature), 0);
+  const minTemp = Math.min(...data.map((d) => d.temperature), 0);
+
+  // 📈 Moving Average (10 จุด)
+  const tempTrend = data.map((d, i, arr) => {
+    const window = arr.slice(Math.max(0, i - 10), i + 1);
+    return (
+      window.reduce((sum, x) => sum + x.temperature, 0) / window.length || 0
+    );
+  });
+
+  const humTrend = data.map((d, i, arr) => {
+    const window = arr.slice(Math.max(0, i - 10), i + 1);
+    return (
+      window.reduce((sum, x) => sum + x.humidity, 0) / window.length || 0
+    );
+  });
+
+  // 📤 Export CSV (แก้บั๊กแล้ว ✅)
+  const exportCSV = async () => {
+    const since = new Date(Date.now() - timeRange).toISOString();
+    const { data: logs, error } = await supabase
+      .from("sensor_logs")
+      .select("*")
+      .gte("created_at", since)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      alert("Error fetching data from database");
+      console.error(error);
+      return;
+    }
+
+    if (!logs || logs.length === 0) {
+      alert("No data found in database");
+      return;
+    }
+
+    // เติมค่าที่หายไป (Gap > 15s)
+    const filled = [];
+    let lastTemp = logs[0].temperature;
+    let lastHum = logs[0].humidity;
+    let lastTime = new Date(logs[0].created_at).getTime();
+
+    for (let i = 0; i < logs.length; i++) {
+      const current = new Date(logs[i].created_at).getTime();
+      const diff = current - lastTime;
+
+      if (diff > 16000) {
+        const missingSteps = Math.floor(diff / 15000) - 1;
+        for (let j = 1; j <= missingSteps; j++) {
+          const fakeTime = new Date(lastTime + j * 15000);
+          filled.push({
+            time: fakeTime.toLocaleTimeString("th-TH", {
+              hour12: false,
+              timeZone: "Asia/Bangkok",
+            }),
+            temperature: lastTemp,
+            humidity: lastHum,
+            note: "MISSING → filled from last value",
+          });
+        }
+      }
+
+      filled.push({
+        time: new Date(logs[i].created_at).toLocaleTimeString("th-TH", {
+          hour12: false,
+          timeZone: "Asia/Bangkok",
+        }),
+        temperature: logs[i].temperature,
+        humidity: logs[i].humidity,
+        note: "REAL",
+      });
+
+      lastTemp = logs[i].temperature;
+      lastHum = logs[i].humidity;
+      lastTime = current;
+    }
+
+    // ✅ สร้าง CSV
+    const header = "Time,Temperature (°C),Humidity (%),Status\n";
+    const rows = filled
+      .map(
+        (d) => `${d.time},${d.temperature},${d.humidity},${d.note}`
+      )
       .join("\n");
     const csv = header + rows;
 
+    // ✅ ดาวน์โหลดไฟล์
     const blob = new Blob([csv], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `jetson_data_${new Date()
+    a.download = `jetson_data_filled_${new Date()
       .toISOString()
       .slice(0, 19)
       .replace(/:/g, "-")}.csv`;
@@ -132,22 +270,58 @@ export default function Dashboard() {
     document.body.removeChild(a);
   };
 
-  // ตัวเลือกกราฟ
+  // ⚙️ การตั้งค่ากราฟ Chart.js
   const chartOptions = {
     responsive: true,
+    animation: false,
     scales: {
-      x: { grid: { color: "rgba(255,255,255,0.1)" } },
-      y: { grid: { color: "rgba(255,255,255,0.1)" } },
+      x: {
+        grid: { color: "rgba(255,255,255,0.1)" },
+        ticks: { color: "#ccc" },
+      },
+      y: {
+        grid: { color: "rgba(255,255,255,0.1)" },
+        ticks: { color: "#ccc" },
+      },
     },
-    elements: { point: { radius: 2 } },
-    plugins: { legend: { labels: { color: "#fff" } } },
+    elements: {
+      point: { radius: 2 },
+      line: { tension: 0.3, borderWidth: 2 },
+    },
+    plugins: {
+      legend: { labels: { color: "#fff" } },
+      tooltip: { animation: false },
+    },
   };
 
+  // 🎨 สีสถานะการเชื่อมต่อ
+  const statusColor =
+    connectionStatus === "connected"
+      ? "text-green-400"
+      : connectionStatus === "unstable"
+      ? "text-yellow-400"
+      : "text-red-400";
+
+  const statusText =
+    connectionStatus === "connected"
+      ? "🟢 Connected"
+      : connectionStatus === "unstable"
+      ? "🟡 Unstable"
+      : "🔴 Connection Lost";
+
+  // 🧭 ส่วนแสดงผลหน้าเว็บ
   return (
     <div className="bg-gray-900 text-white min-h-screen p-4">
       <h1 className="text-lg font-bold">🌡️ Jetson Box Dashboard</h1>
+      <p className={`font-semibold ${statusColor}`}>{statusText}</p>
+
       <p>
-        Temp: {temperature.toFixed(1)} °C | Humidity: {humidity.toFixed(1)} %
+        Temp: {temperature.toFixed(1)}°C | Humidity: {humidity.toFixed(1)}%
+      </p>
+
+      <p className="text-sm text-gray-400">
+        Avg Temp: {avgTemp}°C | Max: {maxTemp}°C | Min: {minTemp}°C | Avg Hum:{" "}
+        {avgHum}%
       </p>
 
       <div className="mt-3 space-x-2">
@@ -170,6 +344,7 @@ export default function Dashboard() {
         </button>
       </div>
 
+      {/* กราฟ */}
       <div className="mt-6 space-y-6">
         <div className="bg-gray-800 p-3 rounded-xl shadow-md">
           <h2 className="text-sm mb-2 text-red-400">Temperature (°C)</h2>
@@ -178,11 +353,18 @@ export default function Dashboard() {
               labels: data.map((d) => d.time),
               datasets: [
                 {
-                  label: "temperature",
+                  label: "Temperature (Live)",
                   data: data.map((d) => d.temperature),
-                  borderColor: "#ff6b6b",
-                  backgroundColor: "rgba(255,107,107,0.1)",
+                  borderColor: "rgba(255,107,107,1)",
+                  backgroundColor: "rgba(255,107,107,0.05)",
                   tension: 0.3,
+                },
+                {
+                  label: "Trend (avg)",
+                  data: tempTrend,
+                  borderColor: "rgba(255,255,255,0.4)",
+                  borderDash: [4, 4],
+                  pointRadius: 0,
                 },
               ],
             }}
@@ -197,11 +379,18 @@ export default function Dashboard() {
               labels: data.map((d) => d.time),
               datasets: [
                 {
-                  label: "humidity",
+                  label: "Humidity (Live)",
                   data: data.map((d) => d.humidity),
-                  borderColor: "#4dabf7",
-                  backgroundColor: "rgba(77,171,247,0.1)",
+                  borderColor: "rgba(77,171,247,1)",
+                  backgroundColor: "rgba(77,171,247,0.05)",
                   tension: 0.3,
+                },
+                {
+                  label: "Trend (avg)",
+                  data: humTrend,
+                  borderColor: "rgba(255,255,255,0.4)",
+                  borderDash: [4, 4],
+                  pointRadius: 0,
                 },
               ],
             }}
