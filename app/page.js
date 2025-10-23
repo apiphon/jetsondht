@@ -5,6 +5,7 @@ import { createClient } from "@supabase/supabase-js";
 import mqtt from "mqtt";
 import { Line } from "react-chartjs-2";
 import "chart.js/auto";
+import "chartjs-adapter-date-fns";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
@@ -12,6 +13,7 @@ const supabase = createClient(
 );
 
 export default function Dashboard() {
+  const INTERVAL_MS = 1000;
   const [data, setData] = useState([]);
   const [temperature, setTemperature] = useState(0);
   const [humidity, setHumidity] = useState(0);
@@ -33,10 +35,6 @@ export default function Dashboard() {
 
       if (!error && logs) {
         const formatted = logs.map((row) => ({
-          time: new Date(row.created_at).toLocaleTimeString("th-TH", {
-            hour12: false,
-            timeZone: "Asia/Bangkok",
-          }),
           temperature: row.temperature,
           humidity: row.humidity,
           timestamp: new Date(row.created_at).getTime(),
@@ -68,21 +66,37 @@ export default function Dashboard() {
         setTemperature(temperature);
         setHumidity(humidity);
 
-        // ✅ เพิ่มจุดใหม่และลบข้อมูลเกินช่วงเวลา
         setData((prev) => {
-          const newEntry = {
-            time: now.toLocaleTimeString("th-TH", {
-              hour12: false,
-              timeZone: "Asia/Bangkok",
-            }),
+          const updated = [...prev];
+          const nowTs = now.getTime();
+
+          // เติมช่องว่างด้วยค่าล่าสุด ถ้าช่องว่างระหว่างจุดมากกว่า INTERVAL_MS
+          if (updated.length > 0) {
+            let last = updated[updated.length - 1];
+            let gapTs = nowTs - last.timestamp;
+            while (gapTs > INTERVAL_MS) {
+              const newTs = last.timestamp + INTERVAL_MS;
+              updated.push({
+                timestamp: newTs,
+                temperature: last.temperature,
+                humidity: last.humidity,
+                offline: true,
+              });
+              last = updated[updated.length - 1];
+              gapTs = nowTs - last.timestamp;
+            }
+          }
+
+          // เพิ่มข้อมูลปัจจุบันจาก sensor
+          updated.push({
             temperature,
             humidity,
-            timestamp: now.getTime(),
-          };
-          const updated = [...prev, newEntry].filter(
-            (d) => now.getTime() - d.timestamp <= timeRange
-          );
-          return updated;
+            timestamp: nowTs,
+          });
+
+          // กรองข้อมูลให้เหลือเฉพาะในช่วง timeRange
+          const windowStartTs = nowTs - timeRange;
+          return updated.filter((d) => d.timestamp >= windowStartTs);
         });
 
         // ✅ เขียนลงฐานข้อมูลทุก 15 วินาที
@@ -103,7 +117,6 @@ export default function Dashboard() {
       }
     });
 
-    // 🔍 ตรวจสอบสถานะการเชื่อมต่อและอัปเดตกราฟต่อเนื่อง
     intervalId = setInterval(() => {
       const elapsed = Date.now() - lastMessageRef.current;
 
@@ -111,33 +124,40 @@ export default function Dashboard() {
       else if (elapsed < 40000) setConnectionStatus("unstable");
       else setConnectionStatus("lost");
 
-      // ถ้าไม่มีข้อมูลใหม่เกิน 2 วินาที → ลากค่าล่าสุดต่อ
       setData((prev) => {
         if (prev.length === 0) return prev;
-        const last = prev[prev.length - 1];
-        const now = new Date();
-        const gap = now.getTime() - last.timestamp;
+        const updated = [...prev];
+        const nowTs = Date.now();
+        const last = updated[updated.length - 1];
+        const gap = nowTs - last.timestamp;
 
         if (gap >= 2000) {
-          const hold = {
-            time: now.toLocaleTimeString("th-TH", {
-              hour12: false,
-              timeZone: "Asia/Bangkok",
-            }),
+          let lastTs = last.timestamp;
+          while (lastTs + INTERVAL_MS < nowTs) {
+            lastTs += INTERVAL_MS;
+            updated.push({
+              timestamp: lastTs,
+              temperature: last.temperature,
+              humidity: last.humidity,
+              offline: true,
+            });
+          }
+
+          const offlineFlag =
+            elapsed > 40000 ||
+            (elapsed > 30000 && connectionStatus === "lost");
+
+          updated.push({
+            timestamp: nowTs,
             temperature: last.temperature,
             humidity: last.humidity,
-            timestamp: now.getTime(),
-            offline:
-              elapsed > 40000 ||
-              (elapsed > 30000 && connectionStatus === "lost"),
-          };
-          const updated = [...prev, hold].filter(
-            (d) => now.getTime() - d.timestamp <= timeRange
-          );
-          return updated;
-        }
+            offline: offlineFlag,
+          });
 
-        return prev;
+          const windowStartTs = nowTs - timeRange;
+          return updated.filter((d) => d.timestamp >= windowStartTs);
+        }
+        return updated;
       });
     }, 1000);
 
@@ -171,7 +191,6 @@ export default function Dashboard() {
   const maxTemp = Math.max(...data.map((d) => d.temperature), 0);
   const minTemp = Math.min(...data.map((d) => d.temperature), 0);
 
-  // 📈 Moving Average (10 จุด)
   const tempTrend = data.map((d, i, arr) => {
     const window = arr.slice(Math.max(0, i - 10), i + 1);
     return (
@@ -181,101 +200,22 @@ export default function Dashboard() {
 
   const humTrend = data.map((d, i, arr) => {
     const window = arr.slice(Math.max(0, i - 10), i + 1);
-    return (
-      window.reduce((sum, x) => sum + x.humidity, 0) / window.length || 0
-    );
+    return window.reduce((sum, x) => sum + x.humidity, 0) / window.length || 0;
   });
 
-  // 📤 Export CSV (แก้บั๊กแล้ว ✅)
-  const exportCSV = async () => {
-    const since = new Date(Date.now() - timeRange).toISOString();
-    const { data: logs, error } = await supabase
-      .from("sensor_logs")
-      .select("*")
-      .gte("created_at", since)
-      .order("created_at", { ascending: true });
-
-    if (error) {
-      alert("Error fetching data from database");
-      console.error(error);
-      return;
-    }
-
-    if (!logs || logs.length === 0) {
-      alert("No data found in database");
-      return;
-    }
-
-    // เติมค่าที่หายไป (Gap > 15s)
-    const filled = [];
-    let lastTemp = logs[0].temperature;
-    let lastHum = logs[0].humidity;
-    let lastTime = new Date(logs[0].created_at).getTime();
-
-    for (let i = 0; i < logs.length; i++) {
-      const current = new Date(logs[i].created_at).getTime();
-      const diff = current - lastTime;
-
-      if (diff > 16000) {
-        const missingSteps = Math.floor(diff / 15000) - 1;
-        for (let j = 1; j <= missingSteps; j++) {
-          const fakeTime = new Date(lastTime + j * 15000);
-          filled.push({
-            time: fakeTime.toLocaleTimeString("th-TH", {
-              hour12: false,
-              timeZone: "Asia/Bangkok",
-            }),
-            temperature: lastTemp,
-            humidity: lastHum,
-            note: "MISSING → filled from last value",
-          });
-        }
-      }
-
-      filled.push({
-        time: new Date(logs[i].created_at).toLocaleTimeString("th-TH", {
-          hour12: false,
-          timeZone: "Asia/Bangkok",
-        }),
-        temperature: logs[i].temperature,
-        humidity: logs[i].humidity,
-        note: "REAL",
-      });
-
-      lastTemp = logs[i].temperature;
-      lastHum = logs[i].humidity;
-      lastTime = current;
-    }
-
-    // ✅ สร้าง CSV
-    const header = "Time,Temperature (°C),Humidity (%),Status\n";
-    const rows = filled
-      .map(
-        (d) => `${d.time},${d.temperature},${d.humidity},${d.note}`
-      )
-      .join("\n");
-    const csv = header + rows;
-
-    // ✅ ดาวน์โหลดไฟล์
-    const blob = new Blob([csv], { type: "text/csv" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `jetson_data_filled_${new Date()
-      .toISOString()
-      .slice(0, 19)
-      .replace(/:/g, "-")}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  };
-
-  // ⚙️ การตั้งค่ากราฟ Chart.js
   const chartOptions = {
     responsive: true,
-    animation: false,
+    maintainAspectRatio: false,
+    animation: { duration: 0 },
     scales: {
       x: {
+        type: "time",
+        time: {
+          unit: "second",
+          stepSize: 5,
+          tooltipFormat: "HH:mm:ss",
+          displayFormats: { second: "HH:mm:ss" },
+        },
         grid: { color: "rgba(255,255,255,0.1)" },
         ticks: { color: "#ccc" },
       },
@@ -284,17 +224,10 @@ export default function Dashboard() {
         ticks: { color: "#ccc" },
       },
     },
-    elements: {
-      point: { radius: 2 },
-      line: { tension: 0.3, borderWidth: 2 },
-    },
-    plugins: {
-      legend: { labels: { color: "#fff" } },
-      tooltip: { animation: false },
-    },
+    elements: { point: { radius: 0 }, line: { tension: 0.3, borderWidth: 2 } },
+    plugins: { legend: { labels: { color: "#fff" } } },
   };
 
-  // 🎨 สีสถานะการเชื่อมต่อ
   const statusColor =
     connectionStatus === "connected"
       ? "text-green-400"
@@ -309,16 +242,13 @@ export default function Dashboard() {
       ? "🟡 Unstable"
       : "🔴 Connection Lost";
 
-  // 🧭 ส่วนแสดงผลหน้าเว็บ
   return (
     <div className="bg-gray-900 text-white min-h-screen p-4">
       <h1 className="text-lg font-bold">🌡️ Jetson Box Dashboard</h1>
       <p className={`font-semibold ${statusColor}`}>{statusText}</p>
-
       <p>
         Temp: {temperature.toFixed(1)}°C | Humidity: {humidity.toFixed(1)}%
       </p>
-
       <p className="text-sm text-gray-400">
         Avg Temp: {avgTemp}°C | Max: {maxTemp}°C | Min: {minTemp}°C | Avg Hum:{" "}
         {avgHum}%
@@ -336,66 +266,77 @@ export default function Dashboard() {
             {label}
           </button>
         ))}
-        <button
-          onClick={exportCSV}
-          className="ml-2 bg-green-600 px-2 py-1 rounded"
-        >
-          Export CSV
-        </button>
       </div>
 
-      {/* กราฟ */}
-      <div className="mt-6 space-y-6">
-        <div className="bg-gray-800 p-3 rounded-xl shadow-md">
+      {/* 📈 กราฟเต็มจอ 2 อันใน 1 หน้าจอ */}
+      <div
+        className="flex flex-col mt-4 space-y-4"
+        style={{ height: "calc(100vh - 200px)" }}
+      >
+        {/* Temperature */}
+        <div className="bg-gray-800 p-3 rounded-xl shadow-md flex-1 min-h-0">
           <h2 className="text-sm mb-2 text-red-400">Temperature (°C)</h2>
-          <Line
-            data={{
-              labels: data.map((d) => d.time),
-              datasets: [
-                {
-                  label: "Temperature (Live)",
-                  data: data.map((d) => d.temperature),
-                  borderColor: "rgba(255,107,107,1)",
-                  backgroundColor: "rgba(255,107,107,0.05)",
-                  tension: 0.3,
-                },
-                {
-                  label: "Trend (avg)",
-                  data: tempTrend,
-                  borderColor: "rgba(255,255,255,0.4)",
-                  borderDash: [4, 4],
-                  pointRadius: 0,
-                },
-              ],
-            }}
-            options={chartOptions}
-          />
+          <div className="h-full">
+            <Line
+              data={{
+                datasets: [
+                  {
+                    label: "Temperature (Live)",
+                    data: data.map((d) => ({
+                      x: d.timestamp,
+                      y: d.temperature,
+                    })),
+                    borderColor: "rgba(255,107,107,1)",
+                    backgroundColor: "rgba(255,107,107,0.05)",
+                  },
+                  {
+                    label: "Trend (avg)",
+                    data: data.map((d, i) => ({
+                      x: d.timestamp,
+                      y: tempTrend[i],
+                    })),
+                    borderColor: "rgba(255,255,255,0.4)",
+                    borderDash: [4, 4],
+                    pointRadius: 0,
+                  },
+                ],
+              }}
+              options={chartOptions}
+            />
+          </div>
         </div>
 
-        <div className="bg-gray-800 p-3 rounded-xl shadow-md">
+        {/* Humidity */}
+        <div className="bg-gray-800 p-3 rounded-xl shadow-md flex-1 min-h-0">
           <h2 className="text-sm mb-2 text-blue-400">Humidity (%)</h2>
-          <Line
-            data={{
-              labels: data.map((d) => d.time),
-              datasets: [
-                {
-                  label: "Humidity (Live)",
-                  data: data.map((d) => d.humidity),
-                  borderColor: "rgba(77,171,247,1)",
-                  backgroundColor: "rgba(77,171,247,0.05)",
-                  tension: 0.3,
-                },
-                {
-                  label: "Trend (avg)",
-                  data: humTrend,
-                  borderColor: "rgba(255,255,255,0.4)",
-                  borderDash: [4, 4],
-                  pointRadius: 0,
-                },
-              ],
-            }}
-            options={chartOptions}
-          />
+          <div className="h-full">
+            <Line
+              data={{
+                datasets: [
+                  {
+                    label: "Humidity (Live)",
+                    data: data.map((d) => ({
+                      x: d.timestamp,
+                      y: d.humidity,
+                    })),
+                    borderColor: "rgba(77,171,247,1)",
+                    backgroundColor: "rgba(77,171,247,0.05)",
+                  },
+                  {
+                    label: "Trend (avg)",
+                    data: data.map((d, i) => ({
+                      x: d.timestamp,
+                      y: humTrend[i],
+                    })),
+                    borderColor: "rgba(255,255,255,0.4)",
+                    borderDash: [4, 4],
+                    pointRadius: 0,
+                  },
+                ],
+              }}
+              options={chartOptions}
+            />
+          </div>
         </div>
       </div>
     </div>
