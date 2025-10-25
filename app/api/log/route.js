@@ -1,26 +1,46 @@
+// app/api/log/route.js
+import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const supabase = createClient(supabaseUrl, serviceRoleKey);
+// ทำให้รันฝั่ง Node runtime แน่ๆ (กัน edge บางกรณี)
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 export async function POST(request) {
   try {
-    const body = await request.json();
-    const { temperature, humidity } = body;
+    const { temperature, humidity } = await request.json();
 
-    const { error } = await supabase
-      .from("sensor_logs")
-      .insert([{ temperature, humidity }]);
+    // อ่าน env ตรงนี้ (ภายในฟังก์ชัน) เพื่อไม่ให้ break ตอน build
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-    if (error) {
-      console.error("Insert error:", error);
-      return new Response(JSON.stringify({ error }), { status: 500 });
+    if (!supabaseUrl || !serviceRoleKey) {
+      console.error("Missing Supabase env vars at runtime.");
+      return NextResponse.json(
+        { error: "Server is misconfigured (missing env vars)." },
+        { status: 500 }
+      );
     }
 
-    return new Response(JSON.stringify({ success: true }), { status: 200 });
+    // สร้าง client เมื่อมีคำขอเท่านั้น
+    const supabase = createClient(supabaseUrl, serviceRoleKey);
+
+    const { error } = await supabase.from("sensor_logs").insert([
+      {
+        temperature,
+        humidity,
+        // created_at: จะให้ DB ใส่ค่า NOW() เอง ถ้าคอลัมน์เป็น default now()
+      },
+    ]);
+
+    if (error) {
+      console.error("Supabase insert error:", error);
+      return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+
+    return NextResponse.json({ ok: true });
   } catch (err) {
-    console.error("Server error:", err);
-    return new Response(JSON.stringify({ error: err.message }), { status: 500 });
+    console.error("API /api/log error:", err);
+    return NextResponse.json({ error: "Invalid payload" }, { status: 400 });
   }
 }
